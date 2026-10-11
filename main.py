@@ -1,5 +1,6 @@
-# main.py — نسخة مصلحة كاملة
+# main.py
 import asyncio
+import json as _json
 import logging
 import os
 import random
@@ -20,10 +21,7 @@ from aiogram.types import (
     FSInputFile, InputMediaPhoto, InputMediaVideo,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s: %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger("telegram-bots")
 
 TIKTOK_TOKEN = os.getenv("TIKTOK_BOT_TOKEN", "").strip()
@@ -56,7 +54,7 @@ async def start_web_server() -> web.AppRunner:
     log.info("خادم الفحص يعمل على المنفذ %s", port)
     return runner
 
-# ── تحميل تيك توك عبر tikwm ──────────────────────────────────────────────────
+# ── تحميل تيك توك ─────────────────────────────────────────────────────────────
 TIKWM_API = "https://www.tikwm.com/api/"
 _REQ_HEADERS = {
     "User-Agent": (
@@ -68,26 +66,56 @@ _REQ_HEADERS = {
 }
 
 async def _tikwm_fetch_info(session: aiohttp.ClientSession, url: str) -> dict:
-    """استدعاء tikwm API وإرجاع data أو رفع استثناء."""
-    async with session.post(
-        TIKWM_API,
-        data={"url": url, "hd": 1},
-        timeout=aiohttp.ClientTimeout(total=30),
-    ) as resp:
-        body = await resp.json(content_type=None)
+    body = None
+
+    # محاولة 1 — POST
+    try:
+        async with session.post(
+            TIKWM_API,
+            data={"url": url, "hd": 1},
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            text = await resp.text()
+            if text.strip():
+                try:
+                    body = _json.loads(text)
+                except Exception:
+                    body = None
+    except Exception as exc:
+        log.warning("tikwm POST فشل: %s", exc)
+
+    # محاولة 2 — GET
+    if not body:
+        try:
+            async with session.get(
+                TIKWM_API,
+                params={"url": url, "hd": "1"},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                text = await resp.text()
+                if text.strip():
+                    try:
+                        body = _json.loads(text)
+                    except Exception:
+                        body = None
+        except Exception as exc:
+            log.warning("tikwm GET فشل: %s", exc)
+
+    if not body:
+        raise RuntimeError("tikwm: لم يُرجع أي بيانات")
 
     if body.get("code") != 0:
         raise RuntimeError(f"tikwm: {body.get('msg', 'خطأ غير معروف')}")
-    return body["data"]
 
-async def _stream_to_file(
-    session: aiohttp.ClientSession, src: str, dest: str
-) -> bool:
-    """تنزيل src إلى dest. يُرجع True عند النجاح."""
+    data = body.get("data")
+    if not data:
+        raise RuntimeError("tikwm: الرد فارغ")
+
+    return data
+
+async def _stream_to_file(session: aiohttp.ClientSession, src: str, dest: str) -> bool:
     try:
-        async with session.get(
-            src, timeout=aiohttp.ClientTimeout(total=90)
-        ) as resp:
+        async with session.get(src, timeout=aiohttp.ClientTimeout(total=90)) as resp:
             if resp.status != 200:
                 return False
             with open(dest, "wb") as fh:
@@ -99,7 +127,6 @@ async def _stream_to_file(
         return False
 
 def _img_url(item) -> str:
-    """استخرج URL من عنصر images سواء كان نصًا أو dict."""
     if isinstance(item, str):
         return item
     if isinstance(item, dict):
@@ -107,19 +134,12 @@ def _img_url(item) -> str:
     return ""
 
 async def download_tiktok(url: str, tmpdir: str) -> tuple[dict, list[Path]]:
-    """
-    يُنزّل فيديو تيك توك أو سلايدات (photo posts).
-    يُرجع (info_dict, [Path, ...]).
-    لا يحتاج yt-dlp.
-    """
     async with aiohttp.ClientSession(headers=_REQ_HEADERS) as session:
         data = await _tikwm_fetch_info(session, url)
-
         files: list[Path] = []
         is_slideshow = bool(data.get("images"))
 
         if is_slideshow:
-            # ── سلايدات / صور ──────────────────────────────────────────
             for i, item in enumerate(data["images"]):
                 img_url = _img_url(item)
                 if not img_url:
@@ -127,8 +147,6 @@ async def download_tiktok(url: str, tmpdir: str) -> tuple[dict, list[Path]]:
                 dest = str(Path(tmpdir) / f"slide_{i:03d}.jpg")
                 if await _stream_to_file(session, img_url, dest):
                     files.append(Path(dest))
-
-            # صوت الخلفية
             music_url: str = (
                 data.get("music")
                 or (data.get("music_info") or {}).get("play", "")
@@ -137,10 +155,7 @@ async def download_tiktok(url: str, tmpdir: str) -> tuple[dict, list[Path]]:
                 dest = str(Path(tmpdir) / "audio.mp3")
                 if await _stream_to_file(session, music_url, dest):
                     files.append(Path(dest))
-
         else:
-            # ── فيديو عادي ─────────────────────────────────────────────
-            # hdplay = HD بدون علامة مائية، play = SD بدون علامة، wmplay = بعلامة
             for key in ("hdplay", "play", "wmplay"):
                 video_url: str = data.get(key, "")
                 if not video_url:
@@ -201,8 +216,7 @@ async def tiktok_help(message: Message):
             "طريقة الاستخدام:\n"
             "١. اشترك في القناة.\n"
             "٢. أرسل رابطًا عامًا من تيك توك.\n"
-            "٣. انتظر اكتمال التحميل.\n\n"
-            "قد لا يتوفر الصوت الأصلي في بعض الروابط."
+            "٣. انتظر اكتمال التحميل."
         )
 
 @tiktok_dp.message(F.text)
@@ -227,11 +241,10 @@ async def tiktok_download(message: Message):
             caption = "تم تحميل المنشور بنجاح."
 
         photos_videos: list[tuple[str, Path]] = []
-        audios:        list[Path]              = []
+        audios: list[Path] = []
 
         for path in files:
             if path.stat().st_size > 49 * 1024 * 1024:
-                log.warning("تم تخطي ملف كبير: %s", path.name)
                 continue
             ext = path.suffix.lower()
             if ext in (".jpg", ".jpeg", ".png"):
@@ -246,44 +259,25 @@ async def tiktok_download(message: Message):
 
         await status.edit_text("اكتمل التحميل، جارٍ إرسال الملفات…")
 
-        # إرسال الصوت أولًا
         for audio in audios:
-            await message.answer_audio(
-                FSInputFile(audio),
-                caption="الصوت المستخرج من المنشور",
-            )
+            await message.answer_audio(FSInputFile(audio), caption="الصوت المستخرج من المنشور")
 
-        # إرسال الصور/الفيديوهات على دفعات (10 كحد أقصى لـ Telegram)
         for start in range(0, len(photos_videos), 10):
-            chunk = photos_videos[start : start + 10]
+            chunk = photos_videos[start: start + 10]
             if len(chunk) == 1:
                 kind, path = chunk[0]
                 if kind == "photo":
-                    await message.answer_photo(
-                        FSInputFile(path), caption=caption[:1024]
-                    )
+                    await message.answer_photo(FSInputFile(path), caption=caption[:1024])
                 else:
-                    await message.answer_video(
-                        FSInputFile(path),
-                        caption=caption[:1024],
-                        supports_streaming=True,
-                    )
+                    await message.answer_video(FSInputFile(path), caption=caption[:1024], supports_streaming=True)
             else:
                 group = []
                 for i, (kind, path) in enumerate(chunk):
                     cap = caption[:1024] if i == 0 else None
                     if kind == "photo":
-                        group.append(
-                            InputMediaPhoto(media=FSInputFile(path), caption=cap)
-                        )
+                        group.append(InputMediaPhoto(media=FSInputFile(path), caption=cap))
                     else:
-                        group.append(
-                            InputMediaVideo(
-                                media=FSInputFile(path),
-                                caption=cap,
-                                supports_streaming=True,
-                            )
-                        )
+                        group.append(InputMediaVideo(media=FSInputFile(path), caption=cap, supports_streaming=True))
                 await message.answer_media_group(group)
 
         await status.delete()
@@ -360,10 +354,7 @@ async def azkar_start(message: Message):
 @azkar_dp.message(Command("help"))
 @azkar_dp.message(F.text == "ℹ️ مساعدة")
 async def azkar_help(message: Message):
-    await message.answer(
-        "اختر قسم الأذكار من القائمة الظاهرة أسفل الشاشة.",
-        reply_markup=AZKAR_MENU,
-    )
+    await message.answer("اختر قسم الأذكار من القائمة.", reply_markup=AZKAR_MENU)
 
 @azkar_dp.message(F.text == "📿 تسبيح")
 async def azkar_tasbeeh(message: Message):
@@ -386,7 +377,7 @@ TIME_WINDOWS = [
     ("الصباح", time(5,  0),  time(9,  0)),
     ("الظهر",  time(11, 30), time(13, 30)),
     ("العصر",  time(14, 30), time(16, 30)),
-    ("المغرب", time(17, 30), time(19, 0)),
+    ("المغرب", time(17, 30), time(19,  0)),
     ("العشاء", time(19, 30), time(22, 30)),
 ]
 
@@ -404,7 +395,7 @@ async def automatic_azkar_poster():
             (random_time_for_day(today, start, end), label)
             for label, start, end in TIME_WINDOWS
         ]
-        schedule = [(when, label) for when, label in schedule if when > now]
+        schedule = [(w, l) for w, l in schedule if w > now]
         schedule.sort()
 
         for when, label in schedule:
@@ -414,21 +405,14 @@ async def automatic_azkar_poster():
             try:
                 await azkar_bot.send_message(
                     chat_id=CHANNEL,
-                    text=(
-                        f"📿 <b>ذكر اليوم — {label}</b>\n\n"
-                        f"{random.choice(DAILY_AZKAR)}"
-                    ),
+                    text=f"📿 <b>ذكر اليوم — {label}</b>\n\n{random.choice(DAILY_AZKAR)}",
                 )
                 log.info("تم نشر ذكر تلقائي: %s", label)
             except Exception:
                 log.exception("تعذر نشر الذكر التلقائي.")
 
-        tomorrow = datetime.combine(
-            today + timedelta(days=1), time(0, 1), tzinfo=TIMEZONE
-        )
-        await asyncio.sleep(
-            max(60, (tomorrow - datetime.now(TIMEZONE)).total_seconds())
-        )
+        tomorrow = datetime.combine(today + timedelta(days=1), time(0, 1), tzinfo=TIMEZONE)
+        await asyncio.sleep(max(60, (tomorrow - datetime.now(TIMEZONE)).total_seconds()))
 
 # ── تشغيل البوتات ─────────────────────────────────────────────────────────────
 async def run_bot(bot: Bot, dp: Dispatcher, label: str):
