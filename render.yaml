@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: telegram-bots
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: TIKTOK_BOT_TOKEN
+        sync: false
+      - key: AZKAR_BOT_TOKEN
+        sync: false
