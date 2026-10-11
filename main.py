@@ -4,10 +4,12 @@ import json as _json
 import logging
 import os
 import random
+import re
 import shutil
 import tempfile
 from datetime import datetime, time, timedelta
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -54,8 +56,7 @@ async def start_web_server() -> web.AppRunner:
     log.info("خادم الفحص يعمل على المنفذ %s", port)
     return runner
 
-# ── تحميل تيك توك ─────────────────────────────────────────────────────────────
-TIKWM_API = "https://www.tikwm.com/api/"
+# ── مساعدات تيك توك ───────────────────────────────────────────────────────────
 _REQ_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -65,58 +66,79 @@ _REQ_HEADERS = {
     "Referer": "https://www.tiktok.com/",
 }
 
-async def _tikwm_fetch_info(session: aiohttp.ClientSession, url: str) -> dict:
-    body = None
+def _clean_tiktok_url(url: str) -> str:
+    """
+    أزل معاملات التتبع (_r, _t, وما شابهها).
+    tiktok.com/@user/video/ID  أو  tiktok.com/@user/photo/ID
+    هذا هو الشكل الذي يقبله tikwm.
+    """
+    p = urlparse(url)
+    clean = urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
+    log.info("URL بعد التنظيف: %s", clean)
+    return clean
 
-    # محاولة 1 — POST
+async def _try_parse_json(resp) -> dict | None:
+    """اقرأ نص الرد وحاول تحليله كـ JSON. أرجع None عند الفشل."""
     try:
-        async with session.post(
-            TIKWM_API,
-            data={"url": url, "hd": 1},
-            timeout=aiohttp.ClientTimeout(total=30),
-        ) as resp:
-            text = await resp.text()
-            if text.strip():
-                try:
-                    body = _json.loads(text)
-                except Exception:
-                    body = None
-    except Exception as exc:
-        log.warning("tikwm POST فشل: %s", exc)
+        text = await resp.text()
+    except Exception:
+        return None
+    if not text.strip():
+        log.warning("tikwm: رد فارغ تمامًا (status=%s)", resp.status)
+        return None
+    log.info("tikwm رد خام (أول 300 حرف): %s", text[:300])
+    try:
+        return _json.loads(text)
+    except Exception:
+        log.warning("tikwm: الرد ليس JSON صالحًا")
+        return None
 
-    # محاولة 2 — GET
-    if not body:
+async def _tikwm_fetch_info(session: aiohttp.ClientSession, url: str) -> dict:
+    """
+    جرّب عدة نقاط دخول لـ tikwm بالترتيب.
+    أرجع dict البيانات أو ارفع RuntimeError.
+    """
+    clean_url = _clean_tiktok_url(url)
+    timeout   = aiohttp.ClientTimeout(total=30)
+
+    attempts = [
+        # (method, endpoint, kwargs)
+        ("POST", "https://www.tikwm.com/api/", {"data": {"url": clean_url, "hd": "1"}}),
+        ("GET",  "https://www.tikwm.com/api/", {"params": {"url": clean_url, "hd": "1"}}),
+        ("POST", "https://tikwm.com/api/",     {"data": {"url": clean_url, "hd": "1"}}),
+        ("GET",  "https://tikwm.com/api/",     {"params": {"url": clean_url, "hd": "1"}}),
+        # URL الأصلي (بمعاملاته) كآخر محاولة
+        ("POST", "https://www.tikwm.com/api/", {"data": {"url": url, "hd": "1"}}),
+    ]
+
+    for method, endpoint, kwargs in attempts:
+        log.info("tikwm محاولة: %s %s", method, endpoint)
         try:
-            async with session.get(
-                TIKWM_API,
-                params={"url": url, "hd": "1"},
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                text = await resp.text()
-                if text.strip():
-                    try:
-                        body = _json.loads(text)
-                    except Exception:
-                        body = None
+            fn = session.post if method == "POST" else session.get
+            async with fn(endpoint, timeout=timeout, **kwargs) as resp:
+                body = await _try_parse_json(resp)
+                if not body:
+                    continue
+                code = body.get("code")
+                if code != 0:
+                    log.warning("tikwm code=%s msg=%s", code, body.get("msg"))
+                    continue
+                data = body.get("data")
+                if data:
+                    log.info("tikwm نجح: %s %s", method, endpoint)
+                    return data
         except Exception as exc:
-            log.warning("tikwm GET فشل: %s", exc)
+            log.warning("tikwm فشل (%s %s): %s", method, endpoint, exc)
 
-    if not body:
-        raise RuntimeError("tikwm: لم يُرجع أي بيانات")
-
-    if body.get("code") != 0:
-        raise RuntimeError(f"tikwm: {body.get('msg', 'خطأ غير معروف')}")
-
-    data = body.get("data")
-    if not data:
-        raise RuntimeError("tikwm: الرد فارغ")
-
-    return data
+    raise RuntimeError(
+        "tikwm: جميع المحاولات فشلت — تحقق من اللوج أعلاه لرؤية رد الخادم"
+    )
 
 async def _stream_to_file(session: aiohttp.ClientSession, src: str, dest: str) -> bool:
     try:
         async with session.get(src, timeout=aiohttp.ClientTimeout(total=90)) as resp:
             if resp.status != 200:
+                log.warning("_stream_to_file: status=%s url=%s", resp.status, src)
                 return False
             with open(dest, "wb") as fh:
                 async for chunk in resp.content.iter_chunked(65_536):
@@ -168,13 +190,12 @@ async def download_tiktok(url: str, tmpdir: str) -> tuple[dict, list[Path]]:
         if not files:
             raise RuntimeError("لم يتم تنزيل أي ملف")
 
-        info = {
+        return {
             "title":        data.get("title", "TikTok"),
             "description":  data.get("title", ""),
             "uploader":     (data.get("author") or {}).get("nickname", ""),
             "is_slideshow": is_slideshow,
-        }
-        return info, files
+        }, files
 
 # ── التحقق من الاشتراك ────────────────────────────────────────────────────────
 async def is_subscribed(user_id: int) -> bool:
@@ -205,8 +226,7 @@ async def tiktok_start(message: Message):
     await message.answer(
         "مرحبًا بك في بوت تحميل تيك توك.\n\n"
         "أرسل رابط منشور عام من تيك توك وسيقوم البوت بتحميل الفيديو "
-        "أو الصور المتعددة مع الصوت إن وُجد.\n"
-        "قد لا تعمل الروابط الخاصة أو المحذوفة."
+        "أو الصور المتعددة مع الصوت إن وُجد."
     )
 
 @tiktok_dp.message(Command("help"))
@@ -397,7 +417,6 @@ async def automatic_azkar_poster():
         ]
         schedule = [(w, l) for w, l in schedule if w > now]
         schedule.sort()
-
         for when, label in schedule:
             delay = (when - datetime.now(TIMEZONE)).total_seconds()
             if delay > 0:
@@ -410,7 +429,6 @@ async def automatic_azkar_poster():
                 log.info("تم نشر ذكر تلقائي: %s", label)
             except Exception:
                 log.exception("تعذر نشر الذكر التلقائي.")
-
         tomorrow = datetime.combine(today + timedelta(days=1), time(0, 1), tzinfo=TIMEZONE)
         await asyncio.sleep(max(60, (tomorrow - datetime.now(TIMEZONE)).total_seconds()))
 
