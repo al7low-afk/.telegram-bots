@@ -1,3 +1,4 @@
+# main.py — نسخة مصلحة كاملة
 import asyncio
 import logging
 import os
@@ -8,25 +9,27 @@ from datetime import datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command
 from aiogram.types import (
     Message, ReplyKeyboardMarkup, KeyboardButton,
-    FSInputFile, InputMediaPhoto, InputMediaVideo
+    FSInputFile, InputMediaPhoto, InputMediaVideo,
 )
-import yt_dlp
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s",
+)
 log = logging.getLogger("telegram-bots")
 
 TIKTOK_TOKEN = os.getenv("TIKTOK_BOT_TOKEN", "").strip()
-AZKAR_TOKEN = os.getenv("AZKAR_BOT_TOKEN", "").strip()
-CHANNEL = os.getenv("REQUIRED_CHANNEL", "@azkar201").strip()
-TIMEZONE = ZoneInfo("Asia/Dubai")
+AZKAR_TOKEN  = os.getenv("AZKAR_BOT_TOKEN",  "").strip()
+CHANNEL      = os.getenv("REQUIRED_CHANNEL", "@azkar201").strip()
+TIMEZONE     = ZoneInfo("Asia/Dubai")
 
 if not TIKTOK_TOKEN:
     raise RuntimeError("متغير Render مفقود: TIKTOK_BOT_TOKEN")
@@ -34,17 +37,17 @@ if not AZKAR_TOKEN:
     raise RuntimeError("متغير Render مفقود: AZKAR_BOT_TOKEN")
 
 tiktok_bot = Bot(TIKTOK_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-azkar_bot = Bot(AZKAR_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-tiktok_dp = Dispatcher()
-azkar_dp = Dispatcher()
+azkar_bot  = Bot(AZKAR_TOKEN,  default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+tiktok_dp  = Dispatcher()
+azkar_dp   = Dispatcher()
 
-# خادم فحص الصحة المطلوب لخدمة Render Web Service
+# ── خادم الفحص ────────────────────────────────────────────────────────────────
 async def health(request: web.Request) -> web.Response:
     return web.Response(text="الخدمة تعمل.")
 
-async def start_web_server():
+async def start_web_server() -> web.AppRunner:
     app = web.Application()
-    app.router.add_get("/", health)
+    app.router.add_get("/",       health)
     app.router.add_get("/health", health)
     runner = web.AppRunner(app)
     await runner.setup()
@@ -53,13 +56,118 @@ async def start_web_server():
     log.info("خادم الفحص يعمل على المنفذ %s", port)
     return runner
 
-# التحقق من اشتراك المستخدم في القناة
+# ── تحميل تيك توك عبر tikwm ──────────────────────────────────────────────────
+TIKWM_API = "https://www.tikwm.com/api/"
+_REQ_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://www.tiktok.com/",
+}
+
+async def _tikwm_fetch_info(session: aiohttp.ClientSession, url: str) -> dict:
+    """استدعاء tikwm API وإرجاع data أو رفع استثناء."""
+    async with session.post(
+        TIKWM_API,
+        data={"url": url, "hd": 1},
+        timeout=aiohttp.ClientTimeout(total=30),
+    ) as resp:
+        body = await resp.json(content_type=None)
+
+    if body.get("code") != 0:
+        raise RuntimeError(f"tikwm: {body.get('msg', 'خطأ غير معروف')}")
+    return body["data"]
+
+async def _stream_to_file(
+    session: aiohttp.ClientSession, src: str, dest: str
+) -> bool:
+    """تنزيل src إلى dest. يُرجع True عند النجاح."""
+    try:
+        async with session.get(
+            src, timeout=aiohttp.ClientTimeout(total=90)
+        ) as resp:
+            if resp.status != 200:
+                return False
+            with open(dest, "wb") as fh:
+                async for chunk in resp.content.iter_chunked(65_536):
+                    fh.write(chunk)
+        return True
+    except Exception as exc:
+        log.warning("_stream_to_file فشل (%s): %s", src, exc)
+        return False
+
+def _img_url(item) -> str:
+    """استخرج URL من عنصر images سواء كان نصًا أو dict."""
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        return item.get("url") or (item.get("url_list") or [""])[0]
+    return ""
+
+async def download_tiktok(url: str, tmpdir: str) -> tuple[dict, list[Path]]:
+    """
+    يُنزّل فيديو تيك توك أو سلايدات (photo posts).
+    يُرجع (info_dict, [Path, ...]).
+    لا يحتاج yt-dlp.
+    """
+    async with aiohttp.ClientSession(headers=_REQ_HEADERS) as session:
+        data = await _tikwm_fetch_info(session, url)
+
+        files: list[Path] = []
+        is_slideshow = bool(data.get("images"))
+
+        if is_slideshow:
+            # ── سلايدات / صور ──────────────────────────────────────────
+            for i, item in enumerate(data["images"]):
+                img_url = _img_url(item)
+                if not img_url:
+                    continue
+                dest = str(Path(tmpdir) / f"slide_{i:03d}.jpg")
+                if await _stream_to_file(session, img_url, dest):
+                    files.append(Path(dest))
+
+            # صوت الخلفية
+            music_url: str = (
+                data.get("music")
+                or (data.get("music_info") or {}).get("play", "")
+            )
+            if music_url:
+                dest = str(Path(tmpdir) / "audio.mp3")
+                if await _stream_to_file(session, music_url, dest):
+                    files.append(Path(dest))
+
+        else:
+            # ── فيديو عادي ─────────────────────────────────────────────
+            # hdplay = HD بدون علامة مائية، play = SD بدون علامة، wmplay = بعلامة
+            for key in ("hdplay", "play", "wmplay"):
+                video_url: str = data.get(key, "")
+                if not video_url:
+                    continue
+                dest = str(Path(tmpdir) / "video.mp4")
+                if await _stream_to_file(session, video_url, dest):
+                    files.append(Path(dest))
+                    break
+
+        if not files:
+            raise RuntimeError("لم يتم تنزيل أي ملف")
+
+        info = {
+            "title":        data.get("title", "TikTok"),
+            "description":  data.get("title", ""),
+            "uploader":     (data.get("author") or {}).get("nickname", ""),
+            "is_slideshow": is_slideshow,
+        }
+        return info, files
+
+# ── التحقق من الاشتراك ────────────────────────────────────────────────────────
 async def is_subscribed(user_id: int) -> bool:
     try:
         member = await tiktok_bot.get_chat_member(CHANNEL, user_id)
         return member.status in ("member", "administrator", "creator")
     except Exception:
-        log.exception("تعذر التحقق من الاشتراك. تأكد من أن بوت التحميل مشرف في القناة.")
+        log.exception("تعذر التحقق من الاشتراك.")
         return False
 
 async def require_subscription(message: Message) -> bool:
@@ -74,15 +182,16 @@ async def require_subscription(message: Message) -> bool:
     )
     return False
 
+# ── معالجات بوت تيك توك ──────────────────────────────────────────────────────
 @tiktok_dp.message(Command("start"))
 async def tiktok_start(message: Message):
     if not await require_subscription(message):
         return
     await message.answer(
         "مرحبًا بك في بوت تحميل تيك توك.\n\n"
-        "أرسل رابط منشور عام من تيك توك. سيحاول البوت تحميل الفيديو أو الصور المتعددة "
-        "وإرفاق وصف المنشور، وإرسال الصوت إذا كان متاحًا.\n"
-        "قد لا تعمل بعض الروابط الخاصة أو المحذوفة أو المحمية."
+        "أرسل رابط منشور عام من تيك توك وسيقوم البوت بتحميل الفيديو "
+        "أو الصور المتعددة مع الصوت إن وُجد.\n"
+        "قد لا تعمل الروابط الخاصة أو المحذوفة."
     )
 
 @tiktok_dp.message(Command("help"))
@@ -93,26 +202,8 @@ async def tiktok_help(message: Message):
             "١. اشترك في القناة.\n"
             "٢. أرسل رابطًا عامًا من تيك توك.\n"
             "٣. انتظر اكتمال التحميل.\n\n"
-            "قد لا يتوفر الصوت الأصلي أو وصف المنشور في بعض الروابط."
+            "قد لا يتوفر الصوت الأصلي في بعض الروابط."
         )
-
-def download_tiktok(url: str, folder: str):
-    opts = {
-        "outtmpl": str(Path(folder) / "%(id)s_%(autonumber)03d.%(ext)s"),
-        "format": "best[ext=mp4]/best",
-        "noplaylist": False,
-        "quiet": True,
-        "no_warnings": True,
-        "retries": 3,
-        "fragment_retries": 3,
-        "socket_timeout": 30,
-        "max_filesize": 49 * 1024 * 1024,
-        "extractor_retries": 2,
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-    files = sorted([p for p in Path(folder).iterdir() if p.is_file()])
-    return info, files
 
 @tiktok_dp.message(F.text)
 async def tiktok_download(message: Message):
@@ -128,18 +219,19 @@ async def tiktok_download(message: Message):
     status = await message.answer("جارٍ فحص الرابط ومحاولة تحميل الوسائط…")
     tmpdir = tempfile.mkdtemp(prefix="tiktok_")
     try:
-        loop = asyncio.get_running_loop()
-        info, files = await loop.run_in_executor(None, download_tiktok, url, tmpdir)
-        if not files:
-            raise RuntimeError("لم يتم تنزيل أي ملف.")
+        info, files = await download_tiktok(url, tmpdir)
+
         description = (info or {}).get("description") or (info or {}).get("title") or ""
         caption = ("وصف المنشور:\n" + str(description).strip())[:1000]
         if not caption.strip():
             caption = "تم تحميل المنشور بنجاح."
 
-        photos_videos, audios = [], []
+        photos_videos: list[tuple[str, Path]] = []
+        audios:        list[Path]              = []
+
         for path in files:
             if path.stat().st_size > 49 * 1024 * 1024:
+                log.warning("تم تخطي ملف كبير: %s", path.name)
                 continue
             ext = path.suffix.lower()
             if ext in (".jpg", ".jpeg", ".png"):
@@ -149,54 +241,71 @@ async def tiktok_download(message: Message):
             elif ext in (".mp3", ".m4a", ".aac", ".wav", ".ogg", ".opus"):
                 audios.append(path)
 
-        await status.edit_text("اكتمل التحميل، جارٍ إرسال الملفات…")
-        for audio in audios:
-            await message.answer_audio(FSInputFile(audio), caption="الصوت المستخرج من المنشور")
-
         if not photos_videos and not audios:
             raise RuntimeError("لم يتم العثور على وسائط قابلة للإرسال.")
 
+        await status.edit_text("اكتمل التحميل، جارٍ إرسال الملفات…")
+
+        # إرسال الصوت أولًا
+        for audio in audios:
+            await message.answer_audio(
+                FSInputFile(audio),
+                caption="الصوت المستخرج من المنشور",
+            )
+
+        # إرسال الصور/الفيديوهات على دفعات (10 كحد أقصى لـ Telegram)
         for start in range(0, len(photos_videos), 10):
-            chunk = photos_videos[start:start + 10]
+            chunk = photos_videos[start : start + 10]
             if len(chunk) == 1:
                 kind, path = chunk[0]
                 if kind == "photo":
-                    await message.answer_photo(FSInputFile(path), caption=caption[:1024])
+                    await message.answer_photo(
+                        FSInputFile(path), caption=caption[:1024]
+                    )
                 else:
                     await message.answer_video(
-                        FSInputFile(path), caption=caption[:1024], supports_streaming=True
+                        FSInputFile(path),
+                        caption=caption[:1024],
+                        supports_streaming=True,
                     )
-            elif chunk:
+            else:
                 group = []
                 for i, (kind, path) in enumerate(chunk):
                     cap = caption[:1024] if i == 0 else None
                     if kind == "photo":
-                        group.append(InputMediaPhoto(media=FSInputFile(path), caption=cap))
+                        group.append(
+                            InputMediaPhoto(media=FSInputFile(path), caption=cap)
+                        )
                     else:
-                        group.append(InputMediaVideo(
-                            media=FSInputFile(path), caption=cap, supports_streaming=True
-                        ))
+                        group.append(
+                            InputMediaVideo(
+                                media=FSInputFile(path),
+                                caption=cap,
+                                supports_streaming=True,
+                            )
+                        )
                 await message.answer_media_group(group)
+
         await status.delete()
+
     except Exception as exc:
         log.warning("فشل تحميل تيك توك: %s", exc, exc_info=True)
         try:
             await status.edit_text(
                 "تعذّر تحميل هذا الرابط.\n\n"
-                "تأكد من أن المنشور عام وغير محذوف، ثم جرّب رابطًا آخر. "
-                "قد يمنع تيك توك الوصول إلى بعض المنشورات."
+                "تأكد من أن المنشور عام وغير محذوف، ثم جرّب رابطًا آخر."
             )
         except Exception:
             pass
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-# بوت الأذكار: قائمة الاستخدام اليدوي
+# ── بوت الأذكار ───────────────────────────────────────────────────────────────
 AZKAR_MENU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🌅 أذكار الصباح"), KeyboardButton(text="🌇 أذكار المساء")],
+        [KeyboardButton(text="🌅 أذكار الصباح"),     KeyboardButton(text="🌇 أذكار المساء")],
         [KeyboardButton(text="🕌 أذكار بعد الصلاة"), KeyboardButton(text="😴 أذكار النوم")],
-        [KeyboardButton(text="📿 تسبيح"), KeyboardButton(text="ℹ️ مساعدة")],
+        [KeyboardButton(text="📿 تسبيح"),             KeyboardButton(text="ℹ️ مساعدة")],
     ],
     resize_keyboard=True,
     input_field_placeholder="اختر قسم الأذكار",
@@ -205,13 +314,15 @@ AZKAR_MENU = ReplyKeyboardMarkup(
 AZKAR_TEXTS = {
     "🌅 أذكار الصباح": (
         "🌅 <b>أذكار الصباح</b>\n\n"
-        "أصبحنا وأصبح الملك لله، والحمد لله، لا إله إلا الله وحده لا شريك له، له الملك وله الحمد، وهو على كل شيء قدير.\n\n"
+        "أصبحنا وأصبح الملك لله، والحمد لله، لا إله إلا الله وحده لا شريك له، "
+        "له الملك وله الحمد، وهو على كل شيء قدير.\n\n"
         "اللهم بك أصبحنا، وبك أمسينا، وبك نحيا، وبك نموت، وإليك النشور.\n\n"
         "رضيت بالله ربًا، وبالإسلام دينًا، وبمحمد ﷺ نبيًا."
     ),
     "🌇 أذكار المساء": (
         "🌇 <b>أذكار المساء</b>\n\n"
-        "أمسينا وأمسى الملك لله، والحمد لله، لا إله إلا الله وحده لا شريك له، له الملك وله الحمد، وهو على كل شيء قدير.\n\n"
+        "أمسينا وأمسى الملك لله، والحمد لله، لا إله إلا الله وحده لا شريك له، "
+        "له الملك وله الحمد، وهو على كل شيء قدير.\n\n"
         "اللهم بك أمسينا، وبك أصبحنا، وبك نحيا، وبك نموت، وإليك المصير.\n\n"
         "رضيت بالله ربًا، وبالإسلام دينًا، وبمحمد ﷺ نبيًا."
     ),
@@ -228,6 +339,7 @@ AZKAR_TEXTS = {
         "قراءة سور الإخلاص والفلق والناس، والنفث في الكفين ومسح ما استطاع من الجسد."
     ),
 }
+
 DAILY_AZKAR = [
     "سبحان الله وبحمده، سبحان الله العظيم.",
     "لا إله إلا الله وحده لا شريك له، له الملك وله الحمد، وهو على كل شيء قدير.",
@@ -240,14 +352,18 @@ DAILY_AZKAR = [
 @azkar_dp.message(Command("start"))
 async def azkar_start(message: Message):
     await message.answer(
-        "السلام عليكم ورحمة الله وبركاته.\nأهلًا بك في بوت الأذكار. اختر القسم الذي ترغب فيه.",
+        "السلام عليكم ورحمة الله وبركاته.\n"
+        "أهلًا بك في بوت الأذكار. اختر القسم الذي ترغب فيه.",
         reply_markup=AZKAR_MENU,
     )
 
 @azkar_dp.message(Command("help"))
 @azkar_dp.message(F.text == "ℹ️ مساعدة")
 async def azkar_help(message: Message):
-    await message.answer("اختر قسم الأذكار من القائمة الظاهرة أسفل الشاشة.", reply_markup=AZKAR_MENU)
+    await message.answer(
+        "اختر قسم الأذكار من القائمة الظاهرة أسفل الشاشة.",
+        reply_markup=AZKAR_MENU,
+    )
 
 @azkar_dp.message(F.text == "📿 تسبيح")
 async def azkar_tasbeeh(message: Message):
@@ -265,24 +381,24 @@ async def azkar_section(message: Message):
 async def azkar_fallback(message: Message):
     await message.answer("يرجى اختيار قسم من القائمة.", reply_markup=AZKAR_MENU)
 
-# توقيت عشوائي واحد داخل كل فترة، بتوقيت الإمارات
+# ── نشر الأذكار التلقائي ──────────────────────────────────────────────────────
 TIME_WINDOWS = [
-    ("الصباح", time(5, 0), time(9, 0)),
-    ("الظهر", time(11, 30), time(13, 30)),
-    ("العصر", time(14, 30), time(16, 30)),
+    ("الصباح", time(5,  0),  time(9,  0)),
+    ("الظهر",  time(11, 30), time(13, 30)),
+    ("العصر",  time(14, 30), time(16, 30)),
     ("المغرب", time(17, 30), time(19, 0)),
     ("العشاء", time(19, 30), time(22, 30)),
 ]
 
-def random_time_for_day(day, start, end):
+def random_time_for_day(day, start: time, end: time) -> datetime:
     start_dt = datetime.combine(day, start, tzinfo=TIMEZONE)
-    end_dt = datetime.combine(day, end, tzinfo=TIMEZONE)
-    seconds = int((end_dt - start_dt).total_seconds())
-    return start_dt + timedelta(seconds=random.randint(0, seconds))
+    end_dt   = datetime.combine(day, end,   tzinfo=TIMEZONE)
+    secs     = int((end_dt - start_dt).total_seconds())
+    return start_dt + timedelta(seconds=random.randint(0, secs))
 
 async def automatic_azkar_poster():
     while True:
-        now = datetime.now(TIMEZONE)
+        now   = datetime.now(TIMEZONE)
         today = now.date()
         schedule = [
             (random_time_for_day(today, start, end), label)
@@ -290,6 +406,7 @@ async def automatic_azkar_poster():
         ]
         schedule = [(when, label) for when, label in schedule if when > now]
         schedule.sort()
+
         for when, label in schedule:
             delay = (when - datetime.now(TIMEZONE)).total_seconds()
             if delay > 0:
@@ -297,30 +414,42 @@ async def automatic_azkar_poster():
             try:
                 await azkar_bot.send_message(
                     chat_id=CHANNEL,
-                    text=f"📿 <b>ذكر اليوم — {label}</b>\n\n{random.choice(DAILY_AZKAR)}",
+                    text=(
+                        f"📿 <b>ذكر اليوم — {label}</b>\n\n"
+                        f"{random.choice(DAILY_AZKAR)}"
+                    ),
                 )
                 log.info("تم نشر ذكر تلقائي: %s", label)
             except Exception:
-                log.exception(
-                    "تعذر نشر الذكر. تأكد أن بوت الأذكار مشرف في القناة ولديه صلاحية نشر الرسائل."
-                )
-        tomorrow = datetime.combine(today + timedelta(days=1), time(0, 1), tzinfo=TIMEZONE)
-        await asyncio.sleep(max(60, (tomorrow - datetime.now(TIMEZONE)).total_seconds()))
+                log.exception("تعذر نشر الذكر التلقائي.")
 
+        tomorrow = datetime.combine(
+            today + timedelta(days=1), time(0, 1), tzinfo=TIMEZONE
+        )
+        await asyncio.sleep(
+            max(60, (tomorrow - datetime.now(TIMEZONE)).total_seconds())
+        )
+
+# ── تشغيل البوتات ─────────────────────────────────────────────────────────────
 async def run_bot(bot: Bot, dp: Dispatcher, label: str):
     await bot.delete_webhook(drop_pending_updates=True)
     log.info("بدء تشغيل بوت %s", label)
-    await dp.start_polling(bot, handle_signals=False, close_bot_session=False)
+    try:
+        await dp.start_polling(bot, handle_signals=False, close_bot_session=False)
+    except asyncio.CancelledError:
+        log.info("بوت %s أُوقف بشكل نظيف.", label)
 
 async def main():
     runner = await start_web_server()
     tasks = [
         asyncio.create_task(run_bot(tiktok_bot, tiktok_dp, "تيك توك")),
-        asyncio.create_task(run_bot(azkar_bot, azkar_dp, "الأذكار")),
+        asyncio.create_task(run_bot(azkar_bot,  azkar_dp,  "الأذكار")),
         asyncio.create_task(automatic_azkar_poster()),
     ]
     try:
         await asyncio.gather(*tasks)
+    except (asyncio.CancelledError, Exception) as exc:
+        log.info("إيقاف التطبيق: %s", exc)
     finally:
         for task in tasks:
             if not task.done():
